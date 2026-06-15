@@ -45,6 +45,9 @@ APLUS_MIN = float(os.getenv("A_PLUS_MIN_CONFIDENCE", "90"))
 
 DATA_FILE = Path("vip_users.json")
 USAGE_FILE = Path("daily_usage.json")
+ACTIVE_SIGNALS_FILE = Path("active_signals.json")
+HISTORY_FILE = Path("signal_history.json")
+MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
 CHART_DIR = Path("charts")
 CHART_DIR.mkdir(exist_ok=True)
 
@@ -107,6 +110,17 @@ def is_vip(user_id: int) -> bool:
         return False
     return expiry > now_utc()
 
+
+
+def get_expiry(user_id: int) -> Optional[datetime]:
+    data = load_vips()
+    user = data.get(str(user_id))
+    if not user:
+        return None
+    try:
+        return datetime.fromisoformat(user["expires_at"])
+    except Exception:
+        return None
 
 def vip_status_text(user_id: int) -> str:
     data = load_vips()
@@ -185,6 +199,20 @@ def fetch_binance_klines(symbol: str, interval: str = TIMEFRAME, limit: int = KL
         logging.warning("Failed fetching %s: %s", symbol, e)
         return None
 
+
+
+def live_price(symbol: str) -> Optional[float]:
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": symbol},
+            timeout=8,
+        )
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception as e:
+        logging.warning("Failed live price %s: %s", symbol, e)
+        return None
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -449,133 +477,239 @@ def create_chart_image(s: Dict[str, Any]) -> Path:
     return path
 
 
+
+# -------------------------
+# Active signal monitoring
+# -------------------------
+
+def add_history(user_id: int, item: Dict[str, Any]) -> None:
+    history = load_json(HISTORY_FILE)
+    history.setdefault(str(user_id), [])
+    history[str(user_id)].insert(0, item)
+    history[str(user_id)] = history[str(user_id)][:30]
+    save_json(HISTORY_FILE, history)
+
+
+def register_active_signal(user_id: int, s: Dict[str, Any]) -> str:
+    signals = load_json(ACTIVE_SIGNALS_FILE)
+    signal_id = f"{user_id}_{s['symbol']}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    signals[signal_id] = {
+        "id": signal_id,
+        "user_id": user_id,
+        "symbol": s["symbol"],
+        "direction": s["direction"],
+        "entry": s["entry"],
+        "sl": s["sl"],
+        "tp1": s["tp1"],
+        "tp2": s["tp2"],
+        "tp3": s["tp3"],
+        "tp4": s["tp4"],
+        "hit_tp1": False,
+        "hit_tp2": False,
+        "hit_tp3": False,
+        "hit_tp4": False,
+        "closed": False,
+        "created_at": now_utc().isoformat(),
+    }
+    save_json(ACTIVE_SIGNALS_FILE, signals)
+    return signal_id
+
+
+def target_hit(direction: str, price: float, target: float, kind: str) -> bool:
+    if direction == "BUY":
+        return price >= target if kind == "tp" else price <= target
+    return price <= target if kind == "tp" else price >= target
+
+
+async def monitor_active_signals(context: ContextTypes.DEFAULT_TYPE):
+    signals = load_json(ACTIVE_SIGNALS_FILE)
+    if not signals:
+        return
+    changed = False
+    for sid, s in list(signals.items()):
+        if s.get("closed"):
+            continue
+        price = live_price(s["symbol"])
+        if price is None:
+            continue
+        user_id = int(s["user_id"])
+        direction = s["direction"]
+        if target_hit(direction, price, float(s["sl"]), "sl"):
+            s["closed"] = True
+            s["result"] = "SL"
+            s["closed_at"] = now_utc().isoformat()
+            changed = True
+            add_history(user_id, {"symbol": s["symbol"], "direction": direction, "result": "SL HIT", "price": price, "time": now_utc().isoformat()})
+            try:
+                await context.bot.send_message(chat_id=user_id, text=(
+                    f"❌ <b>SL HIT</b>\n\n{s['symbol']} {direction}\n"
+                    f"Live Price: <code>{fmt_price(price)}</code>\nSL: <code>{fmt_price(float(s['sl']))}</code>\n\n"
+                    "Signal closed. Wait for next clean setup."
+                ), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            continue
+        for tp_name in ["tp1", "tp2", "tp3", "tp4"]:
+            hit_key = "hit_" + tp_name
+            if not s.get(hit_key) and target_hit(direction, price, float(s[tp_name]), "tp"):
+                s[hit_key] = True
+                changed = True
+                if tp_name == "tp4":
+                    s["closed"] = True
+                    s["result"] = "TP4"
+                    s["closed_at"] = now_utc().isoformat()
+                add_history(user_id, {"symbol": s["symbol"], "direction": direction, "result": tp_name.upper()+" HIT", "price": price, "time": now_utc().isoformat()})
+                extra = "\n\nMove SL to breakeven if momentum continues." if tp_name == "tp1" else "\n\nSecure partial profit and let runner continue." if tp_name in ["tp2", "tp3"] else "\n\nFull target reached. Signal complete."
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=(
+                        f"🎯 <b>{tp_name.upper()} HIT</b>\n\n{s['symbol']} {direction}\n"
+                        f"Live Price: <code>{fmt_price(price)}</code>\n{tp_name.upper()}: <code>{fmt_price(float(s[tp_name]))}</code>" + extra
+                    ), parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+    if changed:
+        save_json(ACTIVE_SIGNALS_FILE, signals)
+
+
+async def show_history(user_id: int, message):
+    history = load_json(HISTORY_FILE).get(str(user_id), [])
+    if not history:
+        return await message.reply_text("📜 No signal history yet.")
+    lines = ["📜 <b>Recent Signal History</b>\n"]
+    for h in history[:10]:
+        t = datetime.fromisoformat(h["time"]).strftime("%m-%d %H:%M")
+        lines.append(f"{t} | {h['symbol']} {h['direction']} | {h['result']} @ {fmt_price(float(h['price']))}")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def show_performance(user_id: int, message):
+    history = load_json(HISTORY_FILE).get(str(user_id), [])
+    tp_hits = sum(1 for h in history if "TP" in h.get("result", ""))
+    sl_hits = sum(1 for h in history if "SL" in h.get("result", ""))
+    total = tp_hits + sl_hits
+    rate = (tp_hits / total * 100) if total else 0
+    await message.reply_text(f"📊 <b>Performance</b>\n\nTP Updates: {tp_hits}\nSL Hits: {sl_hits}\nWin Update Rate: {rate:.1f}%", parse_mode=ParseMode.HTML)
+
+
 # -------------------------
 # Telegram handlers
 # -------------------------
 
-def main_menu(user_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton("🔥 Get Premium Signal", callback_data="premium_signal")],
-        [InlineKeyboardButton("💎 Get VIP", callback_data="get_vip")],
-        [InlineKeyboardButton("📊 VIP Status", callback_data="status")],
-    ]
-    if is_admin(user_id):
-        buttons.append([InlineKeyboardButton("✅ Admin: Activate VIP", callback_data="admin_help")])
-    return InlineKeyboardMarkup(buttons)
+def expired_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💳 Renew Premium KSh {PREMIUM_PRICE}", callback_data="renew")],
+    ])
+
+
+def active_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Get VIP Signals", callback_data="premium_signal")],
+        [
+            InlineKeyboardButton("📜 History", callback_data="history"),
+            InlineKeyboardButton("📊 Performance", callback_data="performance"),
+        ],
+    ])
+
+
+def status_screen(user_id: int):
+    expiry = get_expiry(user_id)
+    if not expiry or expiry <= now_utc():
+        text = (
+            "❌ <b>Premium subscription ended.</b>\n\n"
+            "Renew to continue enjoying:\n"
+            "• VIP Crypto Signals\n"
+            "• Forex Signals\n"
+            "• Stock Signals\n"
+            "• SMC Analysis\n"
+            "• High-confidence Setups"
+        )
+        return text, expired_keyboard()
+    text = (
+        "✅ <b>Premium Active</b>\n\n"
+        f"Expires: <code>{expiry.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
+        "Tap below to receive today's VIP signals."
+    )
+    return text, active_keyboard()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔥 <b>Auto Premium VIP Signals Bot</b>\n\n"
-        "Paid users tap <b>Get Premium Signal</b> and the bot automatically scans the market, analyzes setups, and sends the best premium signal with chart, TP and SL.\n\n"
-        "No admin signal typing needed.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu(update.effective_user.id),
-    )
+    text, keyboard = status_screen(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = status_screen(update.effective_user.id)
     left, used = user_usage_left(update.effective_user.id)
-    await update.message.reply_text(
-        vip_status_text(update.effective_user.id) + f"\n\nDaily signals used: {used}/{DAILY_SIGNAL_LIMIT}\nRemaining today: {left}"
-    )
+    text += f"\n\nDaily signals used: {used}/{DAILY_SIGNAL_LIMIT}\nRemaining today: {left}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def get_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(
-        f"💎 <b>Get VIP Access</b>\n\n"
-        f"Price: Ksh {PREMIUM_PRICE}\n"
-        f"After payment, send this Telegram ID to admin:\n"
-        f"<code>{user_id}</code>\n\n"
-        f"Admin activates using:\n"
-        f"<code>/addvip {user_id} {VIP_DAYS}</code>",
+        f"💳 <b>Renew Premium KSh {PREMIUM_PRICE}</b>\n\n"
+        "After payment, send your Telegram ID to admin.\n\n"
+        f"Your Telegram ID: <code>{user_id}</code>\n\n"
+        f"Admin activates using:\n<code>/addvip {user_id} {VIP_DAYS}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def premium_signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_vip(user_id):
-        return await update.message.reply_text(
-            "❌ VIP only.\n\nUse /get_vip to activate premium access."
-        )
+async def renew_message(user_id: int, message):
+    await message.reply_text(
+        f"💳 <b>Renew Premium KSh {PREMIUM_PRICE}</b>\n\n"
+        f"Your Telegram ID: <code>{user_id}</code>\n\n"
+        f"After payment, admin activates:\n<code>/addvip {user_id} {VIP_DAYS}</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
+
+async def send_auto_signal_to_user(user_id: int, message):
+    if not is_vip(user_id):
+        text, keyboard = status_screen(user_id)
+        return await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     left, used = user_usage_left(user_id)
     if left <= 0:
-        return await update.message.reply_text(
-            f"⛔ Daily premium signal limit reached.\nUsed: {used}/{DAILY_SIGNAL_LIMIT}\nTry again tomorrow."
-        )
-
-    msg = await update.message.reply_text("🔎 Scanning market for the best premium setup...")
-
+        return await message.reply_text(f"⛔ Daily limit reached. Used: {used}/{DAILY_SIGNAL_LIMIT}")
+    wait = await message.reply_text("🔎 Scanning market for today's best VIP setup...")
     signal = find_best_signal()
     if not signal:
-        return await msg.edit_text(
-            "⚠️ No strong premium setup found right now.\n\nMarket is not clean enough for VIP entry. Try again later."
-        )
-
+        return await wait.edit_text("⚠️ No high-confidence VIP setup right now. Try again later.")
     text = build_signal_text(signal)
     chart = create_chart_image(signal)
+    register_active_signal(user_id, signal)
     increment_usage(user_id)
-
     with chart.open("rb") as photo:
-        await update.message.reply_photo(
-            photo=photo,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
+        await message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML)
+    left_after, _ = user_usage_left(user_id)
+    await wait.edit_text(f"✅ VIP signal delivered.\nRemaining today: {left_after}/{DAILY_SIGNAL_LIMIT}\n\nI will auto-update you when TP or SL is hit.")
 
-    left_after, used_after = user_usage_left(user_id)
-    await msg.edit_text(f"✅ Premium signal delivered.\nRemaining today: {left_after}/{DAILY_SIGNAL_LIMIT}")
+
+async def premium_signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_auto_signal_to_user(update.effective_user.id, update.message)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user_id = q.from_user.id
-
     if q.data == "premium_signal":
-        if not is_vip(user_id):
-            return await q.message.reply_text("❌ VIP only. Tap Get VIP to activate.")
-        left, used = user_usage_left(user_id)
-        if left <= 0:
-            return await q.message.reply_text(f"⛔ Daily limit reached. Used: {used}/{DAILY_SIGNAL_LIMIT}")
-
-        wait = await q.message.reply_text("🔎 Scanning market for the best premium setup...")
-        signal = find_best_signal()
-        if not signal:
-            return await wait.edit_text("⚠️ No strong premium setup found right now. Try again later.")
-
-        text = build_signal_text(signal)
-        chart = create_chart_image(signal)
-        increment_usage(user_id)
-
-        with chart.open("rb") as photo:
-            await q.message.reply_photo(photo=photo, caption=text, parse_mode=ParseMode.HTML)
-
-        left_after, _ = user_usage_left(user_id)
-        await wait.edit_text(f"✅ Premium signal delivered.\nRemaining today: {left_after}/{DAILY_SIGNAL_LIMIT}")
-
-    elif q.data == "get_vip":
-        await get_vip_cmd(update, context)
-
+        await send_auto_signal_to_user(user_id, q.message)
+    elif q.data in ["get_vip", "renew"]:
+        await renew_message(user_id, q.message)
     elif q.data == "status":
+        text, keyboard = status_screen(user_id)
         left, used = user_usage_left(user_id)
-        await q.message.reply_text(
-            vip_status_text(user_id) + f"\n\nDaily signals used: {used}/{DAILY_SIGNAL_LIMIT}\nRemaining today: {left}"
-        )
-
+        text += f"\n\nDaily signals used: {used}/{DAILY_SIGNAL_LIMIT}\nRemaining today: {left}"
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    elif q.data == "history":
+        await show_history(user_id, q.message)
+    elif q.data == "performance":
+        await show_performance(user_id, q.message)
     elif q.data == "admin_help":
         if not is_admin(user_id):
             return await q.message.reply_text("❌ Admin only.")
-        await q.message.reply_text(
-            "Admin commands:\n"
-            "/addvip user_id days\n"
-            "/removevip user_id\n"
-            "/vips\n\n"
-            "Signals are automatic. Admin does not type signals."
-        )
+        await q.message.reply_text("Admin commands:\n/addvip user_id days\n/removevip user_id\n/vips")
 
 
 async def addvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -596,7 +730,9 @@ async def addvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"✅ Your VIP is active.\nYou can now tap 🔥 Get Premium Signal.\nExpires: {expiry.strftime('%Y-%m-%d %H:%M UTC')}",
+            text=("✅ <b>Premium Active</b>\n\n" f"Expires: <code>{expiry.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n" "Tap below to receive today's VIP signals."),
+            parse_mode=ParseMode.HTML,
+            reply_markup=active_keyboard(),
         )
     except Exception:
         pass
@@ -649,6 +785,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    app.job_queue.run_repeating(monitor_active_signals, interval=MONITOR_INTERVAL_SECONDS, first=30)
     app.run_polling()
 
 
